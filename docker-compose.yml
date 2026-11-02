@@ -1,0 +1,90 @@
+name: deploymind
+
+x-api-env: &api-env
+  APP_ENV: ${APP_ENV:-development}
+  DATABASE_URL: postgresql+psycopg://deploymind:deploymind@postgres:5432/deploymind
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  JWT_SECRET: ${JWT_SECRET:-change-me-development-only-jwt-secret-please-rotate}
+  SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-0pZQ4Hn0n3H0q2kQ1lZ8xGk3c9pYc6T2mJv4f1bXw0s=}
+  AI_PROVIDER: ${AI_PROVIDER:-mock}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-mock}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  STORAGE_LOCAL_PATH: /data/storage
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  WEB_BASE_URL: ${WEB_BASE_URL:-http://localhost:3000}
+  ASSISTANT_SERVICE_PATH: /srv/assistant-service
+  PLATFORM_URL_FROM_CONTAINER: http://host.docker.internal:8000
+  LOCAL_DEPLOY_PROBE_HOST: host.docker.internal   # reach published assistant ports from inside api/worker
+  LOG_FORMAT: json
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: deploymind
+      POSTGRES_PASSWORD: deploymind
+      POSTGRES_DB: deploymind
+    ports: ["55432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deploymind"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./apps
+      dockerfile: api/Dockerfile
+    environment: *api-env
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - storage:/data/storage
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    profiles: ["app"]
+
+  worker:
+    build:
+      context: ./apps
+      dockerfile: worker/Dockerfile
+    environment: *api-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - storage:/data/storage
+      # The local Docker deployment adapter builds and runs the assistant service.
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    profiles: ["app"]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        API_INTERNAL_URL: http://api:8000   # baked into Next.js rewrites at build time
+    ports: ["3000:3000"]
+    depends_on: [api]
+    profiles: ["app"]
+
+volumes:
+  pgdata:
+  storage:

@@ -1,0 +1,89 @@
+name: Deploy
+
+# Promotes a container release dev -> staging -> production on AWS ECS Fargate.
+# Production requires approval: configure required reviewers on the "production" GitHub Environment
+# (Settings -> Environments). The DeployMind "github_actions" adapter triggers this workflow via
+# workflow_dispatch; it can also be run manually.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [development, staging, production]
+        required: true
+      version:
+        description: Release version / image tag (e.g. v1.0.3)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write   # OIDC to AWS - no long-lived cloud credentials in GitHub
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-2' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'deploymind-assistant' }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER || 'deploymind' }}
+
+jobs:
+  build-test-push:
+    name: Build, test and push image
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'production' && 'production-build' || inputs.environment }}
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build
+        run: docker build -t assistant:${{ inputs.version }} apps/assistant-service
+      - name: Test inside the image
+        run: docker run --rm assistant:${{ inputs.version }} python -m unittest -v
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with: { image-ref: "assistant:${{ inputs.version }}", severity: "CRITICAL,HIGH", exit-code: "1", ignore-unfixed: true }
+      - id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+      - name: Push
+        run: |
+          docker tag assistant:${{ inputs.version }} ${{ steps.meta.outputs.image }}
+          docker push ${{ steps.meta.outputs.image }}
+
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    needs: build-test-push
+    runs-on: ubuntu-latest
+    # GitHub Environments enforce approval gates (required reviewers) and environment-scoped secrets.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.PUBLIC_URL }}
+    concurrency: { group: "deploy-${{ inputs.environment }}", cancel-in-progress: false }
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Render task definition with the new image
+        id: td
+        run: |
+          SERVICE="deploymind-${{ inputs.environment }}-assistant"
+          aws ecs describe-task-definition --task-definition "$SERVICE" --query taskDefinition > td.json
+          jq --arg IMG "${{ needs.build-test-push.outputs.image }}" \
+            '.containerDefinitions[0].image=$IMG | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' td.json > td-new.json
+          echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+      - name: Deploy and wait for stability (ECS rolls back automatically via the deployment circuit breaker)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: td-new.json
+          service: ${{ steps.td.outputs.service }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+      - name: Smoke test
+        if: vars.PUBLIC_URL != ''
+        run: curl -fsS --retry 10 --retry-delay 6 "${{ vars.PUBLIC_URL }}/health" | tee /dev/stderr | grep -q '"status":"ok"'
